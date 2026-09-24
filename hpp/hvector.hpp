@@ -466,26 +466,39 @@ private:
     // 于是既有二次析构（析构函数又去析构那个死槽位），又有资源泄漏。
     //
     // 正确的做法是"构造 + 赋值"而不是"移动 + 析构"：
-    //   1) 先在最末尾的后继槽位构造出多出来的那个元素（此刻容器还没变）；
-    //   2) 立刻 ++size_ 把它纳入管理，此后 [0, size_) 始终全是活对象；
-    //   3) 从后往前用移动赋值把 [idx, size_-2] 搬到 [idx+1, size_-1]；
-    //   4) 把新值写入 idx。
-    // 异常保证：第 1 步抛 -> 容器完全没变（强保证）；
-    //          第 3/4 步抛 -> 容器仍有效、无死槽位、无孤儿对象（基本保证）。
+    //   1) 先把实参落成一个独立的临时对象（别名安全，见下）；
+    //   2) 在最末尾的后继槽位构造出多出来的那个元素（此刻容器还没变）；
+    //   3) 立刻 ++size_ 把它纳入管理，此后 [0, size_) 始终全是活对象；
+    //   4) 从后往前用移动赋值把 [idx, size_-2] 搬到 [idx+1, size_-1]；
+    //   5) 把临时对象移动赋值进 idx。
+    // 异常保证：第 1/2 步抛 -> 容器完全没变（强保证）；
+    //          第 4/5 步抛 -> 容器仍有效、无死槽位、无孤儿对象（基本保证）。
+    //
+    // 第 1 步是为了别名：实参可能引用容器自己的元素（v.insert(0, v[2])）。
+    // 第 4 步会把下标 [idx, size_) 上的元素整体移动一格，被引用的那个对象会先被覆盖掉，
+    // 于是第 5 步赋进去的是一个已经被搬走的值——同一个调用会因为容量够不够（走这条路径
+    // 还是扩容路径）而给出不同的答案。先落成临时对象之后，搬移怎么改都读不到它了。
+    // 代价是每次非扩容插入多一次移动构造 + 一次移动赋值；尾部追加走下面的早退分支，
+    // 不付这个代价。对只移类型（unique_ptr）走移动，对只拷贝类型退化成拷贝。
+    //
+    // 设计取舍：这条路径用的是**移动赋值**，所以要求 T 可移动赋值；
+    // 旧版的 uninitialized_move + 显式析构只要求可移动构造（见 README 第 11 节）。
     template<typename U>
     void _insert_no_realloc(size_t idx, U&& val) {
-        if(idx == size_) {                        // 尾部追加，根本不需要搬移
+        if(idx == size_) {                        // 尾部追加，根本不需要搬移，也不会有别名问题
             new (data_ + size_) T(std::forward<U>(val));
             ++size_;
             return;
         }
+
+        T value(std::forward<U>(val));
 
         new (data_ + size_) T(std::move_if_noexcept(data_[size_ - 1]));
         ++size_;
         for(size_t i = size_ - 2; i > idx; --i) {
             data_[i] = std::move_if_noexcept(data_[i - 1]);
         }
-        data_[idx] = std::forward<U>(val);
+        data_[idx] = std::move(value);
     }
 
     template<typename U>
@@ -502,26 +515,52 @@ private:
         return data_ + idx;
     }
 
-    template<typename U>
-    void _insert_with_strong_guarantee_impl(size_t idx, U&& val) {
+    // 需要扩容时的插入（emplace_back / push_back / insert / emplace 都汇到这里）：
+    // 先在【新缓冲区】里把 size_ + 1 个元素全部构造好，全部成功之后才析构旧缓冲区、换指针。
+    //   * 构造期间旧缓冲区和它上面的元素完全没被动过；
+    //   * 中途任何一步抛异常 -> 析构新缓冲区里已构造的部分、释放新缓冲区、重抛，
+    //     原容器保持不变（强异常安全保证），也不会留下"已析构的槽位"或"size_ 之外的孤儿对象"。
+    //
+    // 构造顺序：**先构造新元素，再搬移旧元素**。
+    // 这个顺序不是随便定的：实参可能引用容器自己的元素（v.push_back(v[0])、v.insert(2, v[0])）。
+    // 若先搬移，被引用的那个对象就已经被 move 走了，新元素会从 moved-from 状态构造出来——
+    // 值悄悄错掉。std::string 的移动构造是 noexcept，move_if_noexcept 会选移动，
+    // 于是复制出来的是一个空串（旧版这里更糟：先 _reallocator 把旧缓冲区 delete 掉再读实参，
+    // 那是真的 use-after-free）。先构造新元素时旧缓冲区还没被触碰，别名因此是安全的。
+    // libstdc++ 的 _M_realloc_insert 用的也是这个顺序。
+    //
+    // 注意 emplace_back 走这里时 idx == size_，即"新元素在最后"，别名元素一定在它前面，
+    // 所以这处顺序正是 11.1 的关键。
+    template<typename... Args>
+    void _insert_with_strong_guarantee_impl(size_t idx, Args&&... args) {
         size_t new_cap = capacity_ == 0 ? 1 : capacity_ * 2;
         T* new_data = static_cast<T*>(::operator new(new_cap * sizeof(T)));
 
-        size_t constructed = 0;
+        // 已构造的槽位不再是一段前缀 [0, constructed)：新元素落在 idx 上，
+        // 另外两段分列两侧。用三个计数分别记录，catch 里才能只析构真正构造过的东西。
+        size_t head_done = 0;                 // [0, head_done) 已构造
+        bool   mid_done  = false;             // {idx} 已构造
+        size_t tail_done = 0;                 // [idx+1, idx+1+tail_done) 已构造
         try {
-            for (size_t i = 0; i < idx; ++i, ++constructed) {
-                new (new_data + constructed)
-                    T(std::move_if_noexcept(data_[i]));
+            new (new_data + idx) T(std::forward<Args>(args)...);
+            mid_done = true;
+            for (; head_done < idx; ++head_done) {
+                new (new_data + head_done)
+                    T(std::move_if_noexcept(data_[head_done]));
             }
-            new (new_data + constructed) T(std::forward<U>(val));
-            ++constructed;
-            for (size_t i = idx; i < size_; ++i, ++constructed) {
-                new (new_data + constructed)
-                    T(std::move_if_noexcept(data_[i]));
+            for (; tail_done < size_ - idx; ++tail_done) {
+                new (new_data + idx + 1 + tail_done)
+                    T(std::move_if_noexcept(data_[idx + tail_done]));
             }
         } catch (...) {
-            for (size_t i = 0; i < constructed; ++i) {
+            for (size_t i = 0; i < tail_done; ++i) {
+                new_data[idx + 1 + i].~T();
+            }
+            for (size_t i = 0; i < head_done; ++i) {
                 new_data[i].~T();
+            }
+            if (mid_done) {
+                new_data[idx].~T();
             }
             ::operator delete(new_data);
             throw;
@@ -534,43 +573,9 @@ private:
         ++size_;
     }
 
-    template<typename... Args>
-    void _insert_with_strong_guarantee_impl(size_t idx, Args&&... args) {
-       size_t new_cap = capacity_ == 0 ? 1 : capacity_ * 2;
-        T* new_data = static_cast<T*>(::operator new(new_cap * sizeof(T)));
-
-        size_t constructed = 0;
-        try {
-            for (size_t i = 0; i < idx; ++i, ++constructed) {
-                new (new_data + constructed)
-                    T(std::move_if_noexcept(data_[i]));
-            }
-            new (new_data + constructed) T(std::forward<Args>(args)...);
-            ++constructed;
-            for (size_t i = idx; i < size_; ++i, ++constructed) {
-                new (new_data + constructed)
-                    T(std::move_if_noexcept(data_[i]));
-            }
-        } catch (...) {
-            for (size_t i = 0; i < constructed; ++i) {
-                new_data[i].~T();
-            }
-            ::operator delete(new_data);
-            throw;
-        }
-
-        _destruct_data();
-        ::operator delete(data_);
-        data_ = new_data;
-        capacity_ = new_cap;
-        ++size_;
-    }
-
-    template<typename U>
-    void _insert_with_strong_guarantee(size_t idx, U&& val) {
-        _insert_with_strong_guarantee_impl(idx, std::forward<U>(val));
-    }
-
+    // 0 参（emplace_back() 默认构造）、1 参（push_back / insert 转发过来的引用）、
+    // N 参变参都走这一个重载。原来还有一个 template<typename U> 的单参版本，
+    // 函数体和这个一字不差；两份副本只要有一份忘了跟着改，就会出现"只修一半"。
     template<typename... Args>
     void _insert_with_strong_guarantee(size_t idx, Args&&... args) {
         _insert_with_strong_guarantee_impl(idx, std::forward<Args>(args)...);
@@ -585,24 +590,22 @@ private:
         if(fidx == size_)   return first;
 
         size_t new_size = size_ - (lidx - fidx);
-        try {
-            std::move(last, end(), first);
 
-            for(size_t i = new_size; i < size_; ++i) {
-                data_[i].~T();
-            }
-            size_ = new_size;
-        } catch(...) {
-            size_t p = fidx, q = lidx;
-            while(q < size_) {
-                data_[p].~T();
-                std::uninitialized_move(begin() + q, begin() + q + 1, begin() + p);
-                ++p;++q;
-            }
-            for(size_t i = p;i < size_; ++i) {
-                data_[i].~T();
-            }
-            throw;
+        // 这里**故意没有** try/catch。
+        // std::move 的三参版本是逐个元素的【移动赋值】，它不析构任何对象、也不构造任何对象，
+        // 所以中途抛异常时：所有 [0, size_) 的槽位仍然都是活对象，size_ 也还是原值，
+        // 容器处于"有效但内容未指定"的状态——这正是 erase 的基本保证，异常直接往外传即可。
+        //
+        // 曾经这里有一个 catch，试图"修补"成搬移后的样子：它先析构 data_[p]、
+        // 再用 uninitialized_move 从 data_[q] 重建，最后析构 [new_size, size_) 的尾部。
+        // 但那套修补是给上一版"移动一个、析构一个"的 _shift_elements_backward 写的；
+        // 现在没有任何槽位被提前析构，修补反而把 size_ 之外的槽位析构掉了，
+        // 而 size_ 因为异常要继续往外传并没有跟着改小 —— 结果就是 size_ 之内留下死槽位，
+        // 作用域结束时 ~Hvector() 会对它们二次析构（实测 live 计数会变成负数）。
+        // 一句话：内容对不代表状态有效，别在 catch 里做没必要的修补。
+        std::move(last, end(), first);
+        for(size_t i = new_size; i < size_; ++i) {
+            data_[i].~T();
         }
         size_ = new_size;
         return data_ + fidx;

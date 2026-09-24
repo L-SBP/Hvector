@@ -42,7 +42,67 @@ struct Probe {
     bool is_alive() const { return magic == ALIVE; }
 };
 
+// Owner：持有堆资源的类型。用途是让 **LeakSanitizer 自己**（而不只是 live 计数器）
+// 证明"抛异常后没有落在 size_ 之外的孤儿对象"——孤儿对象 = 一个没有被析构的 Owner
+// = 它内部的 unique_ptr 泄漏。移动构造不 tick，让搬移的前几步能成功；移动赋值 tick，
+// 用来精确指定"第几次移动赋值抛异常"。
+struct Owner {
+    static inline int live = 0;
+    static inline int countdown = 0;
+
+    std::unique_ptr<int> ptr;
+
+    static void tick() {
+        if (countdown > 0 && --countdown == 0) {
+            throw std::runtime_error("owner boom");
+        }
+    }
+    static void arm(int n) { countdown = n; }
+
+    explicit Owner(int v = 0) : ptr(new int(v)) { ++live; }
+    Owner(const Owner&) = delete;
+    Owner& operator=(const Owner&) = delete;
+    Owner(Owner&& o) noexcept : ptr(std::move(o.ptr)) { ++live; }
+    Owner& operator=(Owner&& o) {
+        tick();
+        ptr = std::move(o.ptr);
+        return *this;
+    }
+    ~Owner() { --live; }
+
+    int value() const { return ptr ? *ptr : -1; }
+};
+
+// CopyProbe：第 N 次【拷贝构造】抛异常。区间构造 Hvector(iterator, iterator) 的
+// catch 回滚路径需要它——那段代码历史上带着两处笔误零覆盖地躺在仓库里，一 include 就编译不过。
+struct CopyProbe {
+    static constexpr int ALIVE = 0x5A5A;
+    static inline int live = 0;
+    static inline int countdown = 0;
+
+    int magic = ALIVE;
+
+    static void tick() {
+        if (countdown > 0 && --countdown == 0) {
+            throw std::runtime_error("copy boom");
+        }
+    }
+    static void arm(int n) { countdown = n; }
+
+    CopyProbe() { ++live; }
+    CopyProbe(const CopyProbe&) { tick(); ++live; }
+    CopyProbe& operator=(const CopyProbe&) = default;
+    ~CopyProbe() { magic = 0; --live; }
+
+    bool is_alive() const { return magic == ALIVE; }
+};
+
 int main() {
+    // 每个 << 都立刻 flush：std::cout 在重定向到文件/管道时是全缓冲的，
+    // 而失败路径用的是 std::abort() —— 不 flush 的话 FAIL 诊断会随缓冲区一起丢掉，
+    // 重定向跑测试就只能看到一个光秃秃的 "Aborted"。
+    std::cout << std::unitbuf;
+
     std::cout << "==== Test1: emplace_back + 自动扩容 ====\n";
     Hvector<int> v1;
     v1.emplace_back(10);
@@ -616,7 +676,8 @@ int main() {
             std::cout << "PASS 非扩容 insert/emplace 正常路径\n";
         }
 
-        // (b) 强保证：搬移的第一步（末尾备用槽位的移动构造）抛异常，容器应原样不动
+        // (b) 强保证：实参先被落成的那个临时对象在移动构造时抛异常——此时容器还没被碰过，
+        //     所以必须原样不动。tick 编号见 (c) 的说明
         {
             Hvector<Probe> v;
             v.reserve(16);
@@ -643,7 +704,10 @@ int main() {
         }
 
         // (c) 基本保证：搬移过程中的移动赋值抛异常
-        //     第 2/3 次是搬移中的赋值，第 4 次是把新值写入 idx
+        //     非扩容的 insert(size_t(1), Probe(99)) 在 4 元素容器上的 tick 编号：
+        //       #1 实参临时对象的移动构造        #2 末尾备用槽位的移动构造
+        //       #3 #4 搬移中的两次移动赋值       #5 把新值写回 idx 的移动赋值
+        //     arm 2 落在"搬移还没开始"的阶段（容器应原样），3/4 落在搬移阶段（基本保证）
         for (int arm_at : {2, 3, 4}) {
             Hvector<Probe> v;
             v.reserve(16);
@@ -657,13 +721,13 @@ int main() {
                 threw = true;
             }
             if (!threw) {
-                std::cout << "FAIL: 第 " << arm_at << " 次搬移未抛异常\n";
+                std::cout << "FAIL: 第 " << arm_at << " 次移动未抛异常\n";
                 std::abort();
             }
             // 核心：不能有死槽位，也不能有孤儿对象
             check("basic", v);
             std::cout << "PASS 第 " << arm_at
-                      << " 次搬移抛异常 -> 容器仍有效 (size=" << v.size()
+                      << " 次移动抛异常 -> 容器仍有效 (size=" << v.size()
                       << ", live=" << Probe::live << ")\n";
 
             // 抛出异常后容器还能继续正常使用
@@ -723,11 +787,383 @@ int main() {
             std::cout << "PASS 扩容路径抛异常 -> 容器原样（强保证）\n";
         }
 
+        // (f) 扩容路径：新缓冲区在【每一步】抛异常都必须被完整拆掉
+        //     4 元素 / 4 容量上 insert(idx, Probe(99)) 的 tick 编号：
+        //       #1 新元素， #2..#(1+idx) 搬移头部 [0, idx)，其后搬移尾部 [idx, size_)，共 5 次
+        //     新元素的构造顺序改成了"先新元素、再搬移"，catch 里因此要记三段
+        //     （新元素 + 头部前缀 + 尾部前缀），漏掉任何一段都会留下 size_ 之外的孤儿对象。
+        for (size_t idx : {size_t(0), size_t(2), size_t(4)}) {
+            for (int arm_at = 1; arm_at <= 5; ++arm_at) {
+                Hvector<Probe> v;
+                v.reserve(4);
+                for (int i = 0; i < 4; ++i) v.emplace_back(Probe(i));   // size=4 cap=4
+                size_t cap_before = v.capacity();
+
+                Probe::arm(arm_at);
+                bool threw = false;
+                try {
+                    v.insert(idx, Probe(99));
+                } catch (const std::runtime_error&) {
+                    threw = true;
+                }
+                if (!threw) {
+                    std::cout << "FAIL: 扩容路径 idx=" << idx << " 第 " << arm_at
+                              << " 次移动构造未抛异常\n";
+                    std::abort();
+                }
+                if (v.size() != 4 || v.capacity() != cap_before) {
+                    std::cout << "FAIL: 扩容路径 idx=" << idx
+                              << " 抛异常后 size/cap 变了\n";
+                    std::abort();
+                }
+                check("growth-rollback", v);
+                v.clear();
+                if (Probe::live != 0) {
+                    std::cout << "FAIL: 扩容回滚后 clear，live=" << Probe::live << "\n";
+                    std::abort();
+                }
+            }
+        }
+        std::cout << "PASS 扩容路径每一步抛异常 -> 新缓冲区整体回滚（3 个位置 x 5 步 = 15 种组合）\n";
+
         if (Probe::live != 0) {
             std::cout << "FAIL: Probe 泄漏，live=" << Probe::live << "\n";
             std::abort();
         }
         std::cout << "PASS 所有 Probe 均已析构，无泄漏\n";
+    }
+
+    std::cout << "\n==== Test27: 实参引用容器自身（别名） ====\n";
+    {
+        // 局部辅助：把 Hvector<std::string> 与期望值逐元素比对
+        auto expect_str = [](const char* tag, const Hvector<std::string>& v,
+                             std::initializer_list<const char*> expect) {
+            if (v.size() != expect.size()) {
+                std::cout << "FAIL " << tag << ": size=" << v.size()
+                          << " expect=" << expect.size() << "\n";
+                std::abort();
+            }
+            size_t i = 0;
+            for (const char* e : expect) {
+                if (v[i] != e) {
+                    std::cout << "FAIL " << tag << ": v[" << i << "]=\"" << v[i]
+                              << "\" expect=\"" << e << "\"\n";
+                    std::abort();
+                }
+                ++i;
+            }
+            std::cout << "PASS " << tag << ": ";
+            print_vec(tag, v);
+        };
+
+        // (a) 尾部插入 + 必然扩容：push_back(v[0])
+        //     （顺带补上 push_back 的首次覆盖——此前 26 组测试一次都没调用过它）
+        {
+            Hvector<std::string> v;
+            v.emplace_back("AAA");
+            v.emplace_back("BBB");                    // size=2 cap=2，下一次必然扩容
+            v.push_back(v[0]);
+            expect_str("push_back(v[0]) 扩容", v, {"AAA", "BBB", "AAA"});
+        }
+
+        // (b) emplace_back + 必然扩容，别名元素在 idx 之前
+        {
+            Hvector<std::string> v;
+            v.emplace_back("one");
+            v.emplace_back("two");
+            v.emplace_back("three");
+            v.emplace_back("four");                   // size=4 cap=4
+            v.emplace_back(v[1]);
+            expect_str("emplace_back(v[1]) 扩容", v,
+                       {"one", "two", "three", "four", "two"});
+        }
+
+        // (c) 容量富余时的头部插入：非扩容路径（搬移会覆盖被引用的元素）
+        {
+            Hvector<std::string> v;
+            v.emplace_back("A");
+            v.emplace_back("B");
+            v.emplace_back("C");
+            v.emplace_back("D");
+            v.reserve(16);                            // 容量富余 -> _insert_no_realloc
+            v.insert(size_t(0), v[2]);
+            expect_str("insert(0, v[2]) 非扩容", v, {"C", "A", "B", "C", "D"});
+        }
+
+        // (d) 满容量 + idx>0 的中间插入：扩容路径，别名元素在 idx 之前
+        {
+            Hvector<std::string> v;
+            v.emplace_back("A");
+            v.emplace_back("B");
+            v.emplace_back("C");
+            v.emplace_back("D");                      // size=4 cap=4
+            v.insert(size_t(2), v[0]);
+            expect_str("insert(2, v[0]) 扩容", v, {"A", "B", "A", "C", "D"});
+        }
+
+        // (e) int 实例化：拷贝构造会被内联进模板代码，ASan 能插桩到那次读
+        {
+            Hvector<int> v;
+            v.emplace_back(11);
+            v.emplace_back(22);
+            v.push_back(v[0]);
+            expect_vec("int push_back(v[0])", v, {11, 22, 11});
+        }
+
+        // (f) std::vector 对照：同一串调用必须给出相同结果
+        {
+            std::vector<std::string> s;
+            s.emplace_back("AAA");
+            s.emplace_back("BBB");
+            s.push_back(s[0]);
+
+            Hvector<std::string> h;
+            h.emplace_back("AAA");
+            h.emplace_back("BBB");
+            h.push_back(h[0]);
+
+            if (s.size() != h.size()) {
+                std::cout << "FAIL: 与 std::vector 尺寸不一致\n";
+                std::abort();
+            }
+            for (size_t i = 0; i < s.size(); ++i) {
+                if (s[i] != h[i]) {
+                    std::cout << "FAIL: 与 std::vector 不一致 v[" << i
+                              << "]: Hvector=\"" << h[i]
+                              << "\" std::vector=\"" << s[i] << "\"\n";
+                    std::abort();
+                }
+            }
+            std::cout << "PASS 与 std::vector 行为一致: ";
+            print_vec("Hvector", h);
+        }
+    }
+
+    std::cout << "\n==== Test28: erase 抛异常（异常传播 + 容器保持有效） ====\n";
+    {
+        // 校验容器不变量：size 之内的槽位全是活对象，且对象总数恰好等于 size
+        // （前者排除"size 之内的死槽位"，后者排除"size_ 之外的孤儿对象"）
+        auto check = [](const char* tag, const Hvector<Probe>& v) {
+            for (size_t i = 0; i < v.size(); ++i) {
+                if (!v[i].is_alive()) {
+                    std::cout << "FAIL " << tag << ": size 内的槽位 " << i
+                              << " 已被析构（无效状态，析构函数会二次析构）\n";
+                    std::abort();
+                }
+            }
+            if (Probe::live != static_cast<int>(v.size())) {
+                std::cout << "FAIL " << tag << ": live=" << Probe::live
+                          << " size=" << v.size() << "（孤儿对象或泄漏）\n";
+                std::abort();
+            }
+        };
+
+        // (a) erase(0)：搬移过程中的第 2 次移动赋值抛异常
+        {
+            Hvector<Probe> v;
+            v.reserve(16);
+            for (int i = 0; i < 6; ++i) v.emplace_back(Probe(i));
+            size_t before = v.size();
+
+            Probe::arm(2);
+            bool threw = false;
+            try {
+                v.erase(size_t(0));
+            } catch (const std::runtime_error&) {
+                threw = true;
+            }
+
+            // 关键 1：异常必须往外传。erase 是"保证失败"的操作，
+            //         把它伪装成成功返回比直接抛异常危险得多
+            if (!threw) {
+                std::cout << "FAIL: erase 把异常吞掉了（调用方无法感知失败）\n";
+                std::abort();
+            }
+            std::cout << "PASS erase 异常向外传播\n";
+
+            // 关键 2：size_ 必须保持原值，且 size 之内不能有死槽位
+            if (v.size() != before) {
+                std::cout << "FAIL: 抛异常后 size=" << v.size()
+                          << "，应保持 " << before << "\n";
+                std::abort();
+            }
+            check("erase-throw", v);
+            std::cout << "PASS 抛异常后容器有效（size=" << v.size()
+                      << "，无死槽位、无孤儿）\n";
+
+            // 关键 3：抛异常后容器还能继续正常使用
+            v.emplace_back(Probe(100));
+            check("erase-throw-reuse", v);
+            v.erase(size_t(1));
+            check("erase-throw-erase-again", v);
+            v.clear();
+            if (Probe::live != 0) {
+                std::cout << "FAIL: clear 后仍有 live=" << Probe::live << "\n";
+                std::abort();
+            }
+            std::cout << "PASS 抛异常后仍可 emplace_back/erase/clear，最终 live=0\n";
+        }
+
+        // (b) 区间 erase：第 1 次移动赋值就抛
+        {
+            Hvector<Probe> v;
+            v.reserve(16);
+            for (int i = 0; i < 5; ++i) v.emplace_back(Probe(i));
+
+            Probe::arm(1);
+            bool threw = false;
+            try {
+                v.erase(v.begin() + 1, v.begin() + 3);
+            } catch (const std::runtime_error&) {
+                threw = true;
+            }
+            if (!threw) {
+                std::cout << "FAIL: 区间 erase 未把异常传出来\n";
+                std::abort();
+            }
+            if (v.size() != 5) {
+                std::cout << "FAIL: 区间 erase 抛异常后 size=" << v.size()
+                          << "，应保持 5\n";
+                std::abort();
+            }
+            check("range-erase-throw", v);
+            std::cout << "PASS 区间 erase 抛异常 -> 容器仍有效\n";
+            v.clear();
+        }
+
+        if (Probe::live != 0) {
+            std::cout << "FAIL: Test28 结束时 Probe 泄漏，live=" << Probe::live << "\n";
+            std::abort();
+        }
+    }
+
+    std::cout << "\n==== Test29: 资源类型非扩容 insert 抛异常（LeakSanitizer） ====\n";
+    {
+        // Owner 持有 unique_ptr：一旦有对象落在 size_ 之外（没有被析构），
+        // 它内部的堆内存就是真泄漏，LeakSanitizer 会在进程退出时报错。
+        // 4 元素容器上 insert(size_t(1), Owner(99)) 的移动赋值编号：
+        //   #1 #2 = 搬移循环里的两次移动赋值      #3 = 把新值写回 idx
+        for (int arm_at : {1, 2, 3}) {
+            Hvector<Owner> v;
+            v.reserve(16);
+            for (int i = 0; i < 4; ++i) v.emplace_back(Owner(i));
+
+            Owner::arm(arm_at);
+            bool threw = false;
+            try {
+                v.insert(size_t(1), Owner(99));
+            } catch (const std::runtime_error&) {
+                threw = true;
+            }
+
+            if (!threw) {
+                std::cout << "FAIL: 第 " << arm_at << " 次移动赋值未抛异常\n";
+                std::abort();
+            }
+            if (Owner::live != static_cast<int>(v.size())) {
+                std::cout << "FAIL: live=" << Owner::live << " size=" << v.size()
+                          << "（有孤儿对象落在 size_ 之外 -> 泄漏）\n";
+                std::abort();
+            }
+            std::cout << "PASS 第 " << arm_at << " 次移动赋值抛异常 -> live="
+                      << Owner::live << " == size=" << v.size()
+                      << "（无孤儿、无泄漏）\n";
+
+            // 抛异常后仍可继续使用
+            v.emplace_back(Owner(7));
+            if (Owner::live != static_cast<int>(v.size())) {
+                std::cout << "FAIL: 复用后 live=" << Owner::live
+                          << " size=" << v.size() << "\n";
+                std::abort();
+            }
+            v.clear();
+            if (Owner::live != 0) {
+                std::cout << "FAIL: clear 后仍有 live=" << Owner::live << "\n";
+                std::abort();
+            }
+        }
+        std::cout << "PASS 所有 Owner 均已析构（LeakSanitizer 亦应静默）\n";
+    }
+
+    std::cout << "\n==== Test30: 区间构造 Hvector(iterator, iterator) ====\n";
+    {
+        // (a) 来自 std::vector 的元素区间。注意区间构造的形参类型就是 T*，
+        //     不能直接吃 std::vector<int>::iterator（__normal_iterator 不会隐式转成 int*），
+        //     所以用 data() —— 这也是这个构造函数的一个已知局限
+        std::vector<int> src{1, 2, 3, 4, 5};
+        Hvector<int> a(src.data(), src.data() + src.size());
+        expect_vec("range from vector", a, {1, 2, 3, 4, 5});
+        if (a.size() != 5 || a.capacity() != 5) {
+            std::cout << "FAIL: 区间构造后 size=" << a.size()
+                      << " cap=" << a.capacity() << "，应为 5/5\n";
+            std::abort();
+        }
+        std::cout << "PASS range size/capacity = 5/5\n";
+
+        // (b) 裸数组 / 单元素区间 / 空区间
+        int arr[3] = {7, 8, 9};
+        Hvector<int> b(arr, arr + 3);
+        expect_vec("range from array", b, {7, 8, 9});
+
+        Hvector<int> one(arr, arr + 1);
+        expect_vec("range single element", one, {7});
+
+        Hvector<int> none(arr, arr);
+        if (!none.empty() || none.capacity() != 0 || none.data() != nullptr) {
+            std::cout << "FAIL: 空区间应得到 data_==nullptr / cap==0\n";
+            std::abort();
+        }
+        std::cout << "PASS range empty (data_==nullptr, cap==0)\n";
+
+        // (c) std::string 来源 + 深拷贝
+        std::vector<std::string> names{"alpha", "beta", "gamma"};
+        Hvector<std::string> s(names.data(), names.data() + names.size());
+        if (s.size() != 3 || s[0] != "alpha" || s[1] != "beta" || s[2] != "gamma") {
+            std::cout << "FAIL: range string\n";
+            std::abort();
+        }
+        s[0] = "changed";
+        if (names[0] != "alpha") {
+            std::cout << "FAIL: range string 不是深拷贝\n";
+            std::abort();
+        }
+        std::cout << "PASS range string + deep copy\n";
+
+        // (d) 来自另一个 Hvector 的区间，且构造后仍能正常扩容
+        Hvector<int> c(a.begin(), a.end());
+        expect_vec("range from Hvector", c, {1, 2, 3, 4, 5});
+        c.emplace_back(6);
+        expect_vec("range then grow", c, {1, 2, 3, 4, 5, 6});
+
+        // (e) 拷贝构造抛异常 -> catch 回滚，不能泄漏、不能留下野指针
+        {
+            std::vector<CopyProbe> source(6);
+            const int base = CopyProbe::live;          // 源容器里的 6 个活对象
+            CopyProbe::arm(3);                         // 第 3 次拷贝构造抛
+
+            bool threw = false;
+            try {
+                Hvector<CopyProbe> v(source.data(), source.data() + source.size());
+            } catch (const std::runtime_error&) {
+                threw = true;
+            }
+            if (!threw) {
+                std::cout << "FAIL: 区间构造未抛异常\n";
+                std::abort();
+            }
+            if (CopyProbe::live != base) {
+                std::cout << "FAIL: 回滚不干净，live=" << CopyProbe::live
+                          << " 应为 " << base << "（已构造的 2 个没有析构）\n";
+                std::abort();
+            }
+            std::cout << "PASS range ctor rollback: live=" << CopyProbe::live
+                      << " == 源容器元素数\n";
+        }
+        if (CopyProbe::live != 0) {
+            std::cout << "FAIL: CopyProbe 泄漏，live=" << CopyProbe::live << "\n";
+            std::abort();
+        }
+        std::cout << "PASS 区间构造回滚无泄漏\n";
     }
 
     std::cout << "\nAll test done\n";
