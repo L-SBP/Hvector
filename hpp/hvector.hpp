@@ -200,6 +200,14 @@ public:
         other.capacity_ = 0;
         return *this;
     }
+
+    bool operator==(const Hvector& other) const {
+        if(size_ != other.size_)  return false;
+        for(size_t i = 0;i < size_;++i) {
+            if(data_[i] != other.data_[i])   return false;
+        }
+        return true;
+    }
     
     T& operator[](size_t idx) { return data_[idx]; }
     const T& operator[](size_t idx) const { return data_[idx]; }
